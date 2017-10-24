@@ -5,32 +5,26 @@ from decimal import Decimal
 
 from django.apps.registry import Apps
 from django.db.backends.base.schema import BaseDatabaseSchemaEditor
-from django.utils import six
+from django.db.backends.ddl_references import Statement
 
 
 class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
 
     sql_delete_table = "DROP TABLE %(table)s"
-    sql_create_inline_fk = "REFERENCES %(to_table)s (%(to_column)s)"
+    sql_create_fk = None
+    sql_create_inline_fk = "REFERENCES %(to_table)s (%(to_column)s) DEFERRABLE INITIALLY DEFERRED"
     sql_create_unique = "CREATE UNIQUE INDEX %(name)s ON %(table)s (%(columns)s)"
     sql_delete_unique = "DROP INDEX %(name)s"
 
     def __enter__(self):
-        with self.connection.cursor() as c:
-            # Some SQLite schema alterations need foreign key constraints to be
-            # disabled. This is the default in SQLite but can be changed with a
-            # build flag and might change in future, so can't be relied upon.
-            # We enforce it here for the duration of the transaction.
-            c.execute('PRAGMA foreign_keys')
-            self._initial_pragma_fk = c.fetchone()[0]
-            c.execute('PRAGMA foreign_keys = 0')
-        return super(DatabaseSchemaEditor, self).__enter__()
+        # Some SQLite schema alterations need foreign key constraints to be
+        # disabled. Enforce it here for the duration of the transaction.
+        self.connection.disable_constraint_checking()
+        return super().__enter__()
 
     def __exit__(self, exc_type, exc_value, traceback):
-        super(DatabaseSchemaEditor, self).__exit__(exc_type, exc_value, traceback)
-        with self.connection.cursor() as c:
-            # Restore initial FK setting - PRAGMA values can't be parametrized
-            c.execute('PRAGMA foreign_keys = %s' % int(self._initial_pragma_fk))
+        super().__exit__(exc_type, exc_value, traceback)
+        self.connection.enable_constraint_checking()
 
     def quote_value(self, value):
         # The backend "mostly works" without this function and there are use
@@ -46,15 +40,13 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         # Manual emulation of SQLite parameter quoting
         if isinstance(value, type(True)):
             return str(int(value))
-        elif isinstance(value, (Decimal, float)):
+        elif isinstance(value, (Decimal, float, int)):
             return str(value)
-        elif isinstance(value, six.integer_types):
-            return str(value)
-        elif isinstance(value, six.string_types):
-            return "'%s'" % six.text_type(value).replace("\'", "\'\'")
+        elif isinstance(value, str):
+            return "'%s'" % value.replace("\'", "\'\'")
         elif value is None:
             return "NULL"
-        elif isinstance(value, (bytes, bytearray, six.memoryview)):
+        elif isinstance(value, (bytes, bytearray, memoryview)):
             # Bytes are only allowed for BLOB fields, encoded as string
             # literals containing hexadecimal data and preceded by a single "X"
             # character:
@@ -172,7 +164,7 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
             'indexes': indexes,
             'apps': apps,
         }
-        meta = type("Meta", tuple(), meta_contents)
+        meta = type("Meta", (), meta_contents)
         body['Meta'] = meta
         body['__module__'] = model.__module__
 
@@ -192,9 +184,7 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
             # Rename the old table to make way for the new
             self.alter_db_table(model, temp_model._meta.db_table, model._meta.db_table)
 
-            # Create a new table with the updated schema. We remove things
-            # from the deferred SQL that match our table name, too
-            self.deferred_sql = [x for x in self.deferred_sql if temp_model._meta.db_table not in x]
+            # Create a new table with the updated schema.
             self.create_model(temp_model)
 
             # Copy data from the old table into the new table
@@ -219,18 +209,21 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
 
     def delete_model(self, model, handle_autom2m=True):
         if handle_autom2m:
-            super(DatabaseSchemaEditor, self).delete_model(model)
+            super().delete_model(model)
         else:
             # Delete the table (and only that)
             self.execute(self.sql_delete_table % {
                 "table": self.quote_name(model._meta.db_table),
             })
+            # Remove all deferred statements referencing the deleted table.
+            for sql in list(self.deferred_sql):
+                if isinstance(sql, Statement) and sql.references_table(model._meta.db_table):
+                    self.deferred_sql.remove(sql)
 
     def add_field(self, model, field):
         """
-        Creates a field on a model.
-        Usually involves adding a column, but may involve adding a
-        table instead (for M2M fields)
+        Create a field on a model. Usually involves adding a column, but may
+        involve adding a table instead (for M2M fields).
         """
         # Special-case implicit M2M tables
         if field.many_to_many and field.remote_field.through._meta.auto_created:
@@ -239,7 +232,7 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
 
     def remove_field(self, model, field):
         """
-        Removes a field from a model. Usually involves deleting a column,
+        Remove a field from a model. Usually involves deleting a column,
         but for M2Ms may involve deleting a table.
         """
         # M2M fields are a special case
@@ -257,14 +250,17 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
 
     def _alter_field(self, model, old_field, new_field, old_type, new_type,
                      old_db_params, new_db_params, strict=False):
-        """Actually perform a "physical" (non-ManyToMany) field update."""
+        """Perform a "physical" (non-ManyToMany) field update."""
         # Alter by remaking table
         self._remake_table(model, alter_field=(old_field, new_field))
+        # Rebuild tables with FKs pointing to this field if the PK type changed.
+        if old_field.primary_key and new_field.primary_key and old_type != new_type:
+            for rel in new_field.model._meta.related_objects:
+                if not rel.many_to_many:
+                    self._remake_table(rel.related_model)
 
     def _alter_many_to_many(self, model, old_field, new_field, strict):
-        """
-        Alters M2Ms to repoint their to= endpoints.
-        """
+        """Alter M2Ms to repoint their to= endpoints."""
         if old_field.remote_field.through._meta.db_table == new_field.remote_field.through._meta.db_table:
             # The field name didn't change, but some options did; we have to propagate this altering.
             self._remake_table(
