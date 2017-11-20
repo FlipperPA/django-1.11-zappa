@@ -2,7 +2,7 @@
 Django 1.11.7 release notes
 ===========================
 
-*Expected November 1, 2017*
+*November 1, 2017*
 
 Django 1.11.7 fixes several bugs in 1.11.6.
 
@@ -16,3 +16,6 @@ Bugfixes
 
 * Made ``QuerySet.reverse()`` affect ``nulls_first`` and ``nulls_last``
   (:ticket:`28722`).
+
+* Fixed unquoted table names in ``Subquery`` SQL when using ``OuterRef``
+  (:ticket:`28689`).
